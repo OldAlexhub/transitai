@@ -670,7 +670,7 @@ with accuracy_tab:
             "Confidence reflects model agreement on the selected forecast hour. Demand "
             "confidence comes from how tightly the random-forest trees agree, while staffing "
             "and completion confidence come from repeated dropout-enabled passes through the "
-            "saved Keras model. Narrower intervals push the score higher."
+            "saved operations model. Narrower intervals push the score higher."
         )
 
 st.markdown('<div class="section-label">Forecast table</div>', unsafe_allow_html=True)

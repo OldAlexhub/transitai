@@ -12,10 +12,10 @@ import numpy as np
 import pandas as pd
 from pandas.tseries.holiday import USFederalHolidayCalendar
 from sklearn.ensemble import RandomForestRegressor
-from tensorflow.keras.models import load_model
 
 RF_MODEL_FILE = Path(__file__).resolve().parent / "rf_model.pkl"
-OPS_MODEL_FILE = Path(__file__).resolve().parent / "best_model.h5"
+OPS_MODEL_FILE = Path(__file__).resolve().parent / "best_model.npz"
+LEGACY_OPS_MODEL_FILE = Path(__file__).resolve().parent / "best_model.h5"
 TRIPS_ARTIFACT_FILE = Path(__file__).resolve().parent / "trips.pkl"
 NOTEBOOK_FILE = Path(__file__).resolve().parent / "code.ipynb"
 MC_DROPOUT_SAMPLES = 30
@@ -31,6 +31,126 @@ TRIP_FEATURE_COLUMNS = [
 ]
 OPS_FEATURE_COLUMNS = ["Month", "Day", "Year", "SchHour", "trips", "otp_pass"]
 COUNT_TARGETS = ("drivers", "vehicles", "routes")
+
+
+@dataclass(frozen=True)
+class DenseLayer:
+    name: str
+    kernel: np.ndarray
+    bias: np.ndarray
+    activation: str
+
+
+@dataclass(frozen=True)
+class DropoutLayer:
+    name: str
+    rate: float
+
+
+class NumpyOpsModel:
+    def __init__(self, layers: list[DenseLayer | DropoutLayer], seed: int | None = None):
+        self.layers = layers
+        self._rng = np.random.default_rng(seed)
+
+    @classmethod
+    def from_npz(cls, path: Path) -> "NumpyOpsModel":
+        with np.load(path, allow_pickle=False) as artifact:
+            model_config = artifact["model_config"].item()
+            weights = {name: artifact[name] for name in artifact.files if name != "model_config"}
+        return cls._from_serialized_artifact(model_config, weights)
+
+    @classmethod
+    def from_legacy_h5(cls, path: Path) -> "NumpyOpsModel":
+        try:
+            import h5py
+        except ImportError as exc:  # pragma: no cover - optional legacy conversion path
+            raise ImportError(
+                "Legacy HDF5 ops-model loading requires h5py. Prefer the bundled "
+                "best_model.npz artifact for deployment."
+            ) from exc
+
+        with h5py.File(path, "r") as artifact:
+            model_config = artifact.attrs["model_config"]
+            if isinstance(model_config, bytes):
+                model_config = model_config.decode("utf-8")
+
+            config = json.loads(model_config)
+            weights: dict[str, np.ndarray] = {}
+            for layer in config["config"]["layers"]:
+                if layer["class_name"] != "Dense":
+                    continue
+                name = layer["config"]["name"]
+                layer_group = artifact["model_weights"][name]["sequential_1"][name]
+                weights[f"{name}__kernel"] = layer_group["kernel"][()]
+                weights[f"{name}__bias"] = layer_group["bias"][()]
+
+        return cls._from_serialized_artifact(model_config, weights)
+
+    @classmethod
+    def _from_serialized_artifact(
+        cls, model_config: str, weights: dict[str, np.ndarray]
+    ) -> "NumpyOpsModel":
+        config = json.loads(model_config)
+        layers: list[DenseLayer | DropoutLayer] = []
+
+        for layer in config["config"]["layers"]:
+            class_name = layer["class_name"]
+            layer_config = layer["config"]
+            name = layer_config["name"]
+
+            if class_name == "Dense":
+                layers.append(
+                    DenseLayer(
+                        name=name,
+                        kernel=np.asarray(weights[f"{name}__kernel"], dtype=np.float32),
+                        bias=np.asarray(weights[f"{name}__bias"], dtype=np.float32),
+                        activation=layer_config.get("activation", "linear"),
+                    )
+                )
+            elif class_name == "Dropout":
+                layers.append(
+                    DropoutLayer(name=name, rate=float(layer_config.get("rate", 0.0)))
+                )
+
+        if not layers:
+            raise ValueError("The operations model artifact did not contain any supported layers.")
+
+        return cls(layers)
+
+    def predict(self, inputs: np.ndarray, verbose: int = 0) -> np.ndarray:
+        del verbose
+        return self._forward(inputs, training=False)
+
+    def sample_predict(self, inputs: np.ndarray, sample_count: int) -> np.ndarray:
+        inputs = np.asarray(inputs, dtype=np.float32)
+        return np.stack(
+            [self._forward(inputs, training=True) for _ in range(sample_count)],
+            axis=0,
+        )
+
+    def _forward(self, inputs: np.ndarray, training: bool) -> np.ndarray:
+        activations = np.asarray(inputs, dtype=np.float32)
+        for layer in self.layers:
+            if isinstance(layer, DenseLayer):
+                activations = activations @ layer.kernel + layer.bias
+                activations = _apply_activation(activations, layer.activation)
+                continue
+
+            if training:
+                activations = self._apply_dropout(activations, layer.rate)
+
+        return activations
+
+    def _apply_dropout(self, values: np.ndarray, rate: float) -> np.ndarray:
+        if rate <= 0.0:
+            return values
+
+        keep_prob = 1.0 - rate
+        if keep_prob <= 0.0:
+            return np.zeros_like(values)
+
+        mask = self._rng.binomial(1, keep_prob, size=values.shape).astype(values.dtype)
+        return (values * mask) / keep_prob
 
 
 @dataclass
@@ -56,18 +176,15 @@ def load_saved_forecasting_suite(
     notebook_path: str | Path = NOTEBOOK_FILE,
 ) -> ForecastBundle:
     rf_path = Path(rf_model_path)
-    ops_path = Path(ops_model_path)
+    ops_path = _resolve_ops_model_path(Path(ops_model_path))
 
     if not rf_path.exists():
         raise FileNotFoundError(f"Saved demand model not found: {rf_path}")
-    if not ops_path.exists():
-        raise FileNotFoundError(f"Saved operations model not found: {ops_path}")
 
     trip_model = joblib.load(rf_path)
 
-    ops_model = load_model(ops_path, compile=False)
-
     notes: list[str] = []
+    ops_model = _load_ops_model(ops_path, notes)
     history = _load_trip_history_artifact(Path(trips_artifact_path), notes)
     metrics = _load_notebook_metrics(Path(notebook_path), notes)
 
@@ -171,13 +288,7 @@ def forecast_hours(
         ]
     ).astype(np.float32)
 
-    ops_samples = np.stack(
-        [
-            bundle.ops_model(ops_inputs, training=True).numpy()
-            for _ in range(MC_DROPOUT_SAMPLES)
-        ],
-        axis=0,
-    )
+    ops_samples = bundle.ops_model.sample_predict(ops_inputs, MC_DROPOUT_SAMPLES)
     ops_mean = ops_samples.mean(axis=0)
     ops_lower = np.quantile(ops_samples, 0.1, axis=0)
     ops_upper = np.quantile(ops_samples, 0.9, axis=0)
@@ -378,6 +489,14 @@ def _clip_count(values: np.ndarray) -> np.ndarray:
     return np.clip(values.astype(float), 0.0, None)
 
 
+def _apply_activation(values: np.ndarray, activation: str) -> np.ndarray:
+    if activation == "linear":
+        return values
+    if activation == "relu":
+        return np.maximum(values, 0.0)
+    raise ValueError(f"Unsupported activation in operations model artifact: {activation}")
+
+
 def _confidence_score(forecast: pd.DataFrame, bundle: ForecastBundle) -> np.ndarray:
     trip_width = forecast["trips_upper"] - forecast["trips_lower"]
     driver_width = forecast["drivers_upper"] - forecast["drivers_lower"]
@@ -428,6 +547,29 @@ def _load_trip_history_artifact(path: Path, notes: list[str]) -> pd.DataFrame | 
     history["trips"] = pd.to_numeric(history["trips"], errors="coerce").fillna(0.0)
     history = history[["timestamp", "trips"]].sort_values("timestamp").reset_index(drop=True)
     return history
+
+
+def _resolve_ops_model_path(path: Path) -> Path:
+    if path.exists():
+        return path
+    if path == OPS_MODEL_FILE and LEGACY_OPS_MODEL_FILE.exists():
+        return LEGACY_OPS_MODEL_FILE
+    raise FileNotFoundError(f"Saved operations model not found: {path}")
+
+
+def _load_ops_model(path: Path, notes: list[str]) -> NumpyOpsModel:
+    suffix = path.suffix.lower()
+    if suffix == ".npz":
+        return NumpyOpsModel.from_npz(path)
+
+    if suffix in {".h5", ".keras"}:
+        notes.append(
+            "Loaded the legacy HDF5 operations artifact. Keeping best_model.npz in the "
+            "deployment bundle avoids TensorFlow-era runtime dependencies."
+        )
+        return NumpyOpsModel.from_legacy_h5(path)
+
+    raise ValueError(f"Unsupported operations model artifact: {path.name}")
 
 
 def _load_notebook_metrics(path: Path, notes: list[str]) -> dict[str, dict[str, Any]]:

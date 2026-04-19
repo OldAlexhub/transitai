@@ -45,8 +45,11 @@ The deployed app expects the following files in the project root:
 - `rf_model.pkl`  
   Saved random forest model used for trip-demand forecasting
 
+- `best_model.npz`  
+  Saved lightweight operations-model artifact used for drivers, vehicles, routes, and completion predictions
+
 - `best_model.h5`  
-  Saved Keras model used for drivers, vehicles, routes, and completion predictions
+  Legacy source artifact retained for reproducibility and artifact regeneration
 
 - `trips.pkl`  
   Optional saved trip-history artifact for restoring recent observed demand context in the UI
@@ -69,7 +72,7 @@ At runtime, the app:
 2. builds calendar-based future features
 3. predicts future trip demand
 4. derives demand uncertainty from the random forest ensemble
-5. runs the saved Keras model repeatedly with dropout enabled to estimate operational uncertainty
+5. runs the saved operations model repeatedly with dropout enabled to estimate operational uncertainty
 6. compares forecasted staffing and fleet needs against user-entered capacity
 
 ## Current limitations
@@ -89,6 +92,7 @@ At runtime, the app:
 |-- forecasting.py
 |-- requirements.txt
 |-- rf_model.pkl
+|-- best_model.npz
 |-- best_model.h5
 |-- trips.pkl
 |-- code.ipynb
@@ -159,7 +163,8 @@ Inside the UI, users can:
 - `app.py` contains the Streamlit product surface and visualization logic.
 - `forecasting.py` contains the inference-only backend for artifact loading and forecasting.
 - `rf_model.pkl` is used for trip-demand prediction.
-- `best_model.h5` is used for downstream operations prediction.
+- `best_model.npz` is used for downstream operations prediction.
+- `best_model.h5` is retained as the original legacy training artifact.
 - `code.ipynb` remains useful for retraining and artifact regeneration, but it is no longer part of the deployed runtime path.
 
 ## Recommended artifact improvements

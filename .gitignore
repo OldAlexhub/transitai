@@ -1,0 +1,59 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+.cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+pip-wheel-metadata/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Streamlit runtime logs
+*.log
+streamlit*.log
+.streamlit/secrets.toml
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local environment files
+.env
+.env.*
+.python-version
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local datasets
+denver_trips_synth.csv
+
+# Misc local temp files
+*.tmp
+*.temp
+*.bak
